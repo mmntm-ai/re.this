@@ -20,6 +20,8 @@ data class ClientConfiguration(
     var db: Int? = null,
     var charset: Charset = Charsets.UTF_8,
     var tlsConfig: TLSConfig? = null,
+    var connectionTimeout: Long = 10_000L,
+    var poolTimeout: Long = 10_000L,
     internal var auth: AuthConfiguration? = null,
     internal val connectionConfiguration: ConnectionConfiguration = ConnectionConfiguration(),
     internal val socketConfiguration: SocketConfiguration = SocketConfiguration(),

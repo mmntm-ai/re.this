@@ -33,26 +33,31 @@ internal class ConnectionPool(
     private val connections = Channel<RConnection>(client.cfg.connectionConfiguration.poolSize)
     private val selector = SelectorManager(poolScope.coroutineContext)
 
+    private var connectionAttempts = 0
+    private var activeConnections = 0
+
     init {
         poolScope.launch { prepare() }
     }
 
     internal suspend fun createConn(): RConnection {
         logger.trace { "Creating connection to ${client.address}" }
-        val conn = aSocket(selector)
-            .tcp()
-            .connect(client.address.socket) {
-                client.cfg.socketConfiguration.run {
-                    timeout?.let { socketTimeout = it }
-                    linger?.let { lingerSeconds = it }
-                    this@connect.keepAlive = keepAlive
-                    this@connect.noDelay = noDelay
-                }
-            }.let { socket ->
-                client.cfg.tlsConfig?.let {
-                    socket.tls(selector.coroutineContext, it)
-                } ?: socket
-            }.rConnection()
+        val conn = withTimeout(client.cfg.connectionTimeout) {
+            aSocket(selector)
+                .tcp()
+                .connect(client.address.socket) {
+                    client.cfg.socketConfiguration.run {
+                        timeout?.let { socketTimeout = it }
+                        linger?.let { lingerSeconds = it }
+                        this@connect.keepAlive = keepAlive
+                        this@connect.noDelay = noDelay
+                    }
+                }.let { socket ->
+                    client.cfg.tlsConfig?.let {
+                        socket.tls(selector.coroutineContext, it)
+                    } ?: socket
+                }.rConnection()
+        }
 
         val reqBuffer = Buffer()
         var requests = 0
@@ -82,11 +87,49 @@ internal class ConnectionPool(
     fun prepare() = poolScope.launch(Dispatchers.IO_OR_UNCONFINED) {
         logger.info("Filling ConnectionPool with connections (${client.cfg.connectionConfiguration.poolSize})")
         if (connections.isEmpty) repeat(client.cfg.connectionConfiguration.poolSize) {
-            launch { connections.trySend(createConn()) }
+            connectionAttempts++
+            launch {
+                runCatching { createConn() }
+                    .onSuccess { conn ->
+                        connectionAttempts--
+                        activeConnections++
+                        connections.trySend(conn)
+                    }
+                    .onFailure { ex ->
+                        connectionAttempts--
+                        logger.warn("Failed to create connection during pool preparation", ex)
+                    }
+            }
         }
     }
 
-    suspend fun acquire(): RConnection = connections.receive()
+    suspend fun acquire(): RConnection {
+        // First try to get an existing connection
+        val result = connections.tryReceive()
+        if (result.isSuccess) {
+            return result.getOrThrow()
+        }
+
+        // If pool is empty but we can create more connections, create one
+        poolScope.launch(Dispatchers.IO_OR_UNCONFINED) {
+            if (activeConnections + connectionAttempts < client.cfg.connectionConfiguration.poolSize) {
+                logger.trace { "Pool empty, creating new connection (active: $activeConnections, attempts: $connectionAttempts, poolSize: ${client.cfg.connectionConfiguration.poolSize})" }
+                connectionAttempts++
+                try {
+                    val conn = createConn()
+                    connectionAttempts--
+                    activeConnections++
+                    connections.trySend(conn)
+                } catch (ex: Throwable) {
+                    connectionAttempts--
+                    throw ex
+                }
+            }
+        }
+
+        // Wait for a connection to become available
+        return withTimeout(client.cfg.poolTimeout) { connections.receive() }
+    }
 
     fun release(connection: RConnection) {
         handle(connection)
@@ -95,7 +138,8 @@ internal class ConnectionPool(
     private fun handle(connection: RConnection) = poolScope.launch(Dispatchers.IO_OR_UNCONFINED) {
         logger.trace { "Releasing connection ${connection.socket}" }
         if (connection.input.isClosedForRead) { // connection is corrupted
-            logger.warn("Connection ${connection.socket} is corrupted, refilling")
+            logger.warn("Connection ${connection.socket} is unexpectedly closed, refilling")
+            activeConnections--
             launch {
                 connection.socket.close()
                 refill()
@@ -103,6 +147,7 @@ internal class ConnectionPool(
         } else {
             connections.trySend(connection).onFailure {
                 logger.warn("Pool is full, closing connection ${connection.socket}")
+                activeConnections--
                 connection.socket.close()
             }
         }
@@ -116,13 +161,17 @@ internal class ConnectionPool(
 
         while (attempt < cfg.reconnectAttempts) {
             attempt++
-            logger.trace { "Refilling ConnectionPool. Attempt $attempt" }
+            logger.trace { "Refilling ConnectionPool ($activeConnections + $connectionAttempts / ${client.cfg.connectionConfiguration.poolSize}). Attempt $attempt" }
+            connectionAttempts++
             runCatching { createConn() }
-                .onSuccess {
-                    connections.send(it)
-                    logger.trace { "Connection refilled with $it" }
+                .onSuccess { conn ->
+                    connectionAttempts--
+                    activeConnections++
+                    connections.send(conn)
+                    logger.trace { "Connection refilled with $conn" }
                     return
                 }.onFailure {
+                    connectionAttempts--
                     if (ex != null) ex.addSuppressed(it) else ex = it
                 }
 
@@ -138,9 +187,13 @@ internal class ConnectionPool(
     @OptIn(ExperimentalCoroutinesApi::class)
     suspend fun disconnect() {
         logger.debug("Disconnecting from Redis")
+        connections.close()
         while (!connections.isEmpty) {
             connections.receive().socket.close()
+            activeConnections--
         }
+        connectionAttempts = 0
+        activeConnections = 0
     }
 }
 
@@ -149,7 +202,7 @@ internal suspend inline fun <R> ConnectionPool.use(block: (RConnection) -> R): R
     contract {
         callsInPlace(block, InvocationKind.EXACTLY_ONCE)
     }
-    val connection = acquire()
+    val connection = withTimeout(client.cfg.poolTimeout) { acquire() }
     logger.trace { "Using ${connection.socket} for request" }
     return try {
         block(connection)
